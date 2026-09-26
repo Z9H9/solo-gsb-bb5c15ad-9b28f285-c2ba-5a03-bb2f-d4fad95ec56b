@@ -1057,10 +1057,107 @@ function validateCapacityQuery(
   return { valid: { supplyCapList, demandList, totalSupplyCapExact, totalDemandExact }, errors: [] };
 }
 
+/** 配水建图中的供水上限弧：超级源点 → 供水点。 */
+interface AllocationSupplyArc {
+  supply: string;
+  cap: number;
+  /** 正向弧下标（配对反向弧为 arc ^ 1），用于读取逐点流量与最小割归属 */
+  arc: number;
+}
+
+/** 配水建图中的无向共享容量管段弧（当前开启且非自环的管段）。 */
+interface AllocationPipeArc {
+  id: string;
+  /** 无向弧 u→v 方向的下标；反向弧为 fwdArc ^ 1 */
+  fwdArc: number;
+}
+
+/** 配水建图中的出口需求弧：出口 → 超级汇点。 */
+interface AllocationDemandArc {
+  outlet: string;
+  demand: number;
+  /** 正向弧下标，用于读取该出口获配量与最小割归属 */
+  arc: number;
+}
+
+/**
+ * 配水场景共用的内部建图结果：已挂好「供水上限弧 + 无向共享容量管段弧」的
+ * 残量网络，出口需求弧按需分批挂接。
+ *
+ * 供水能力核验（一次挂全部需求弧）、重点出口优先配水（先挂重点需求弧求最大流、
+ * 再在同一残量网络上挂普通需求弧继续增广）以及增容 / 双阀 / 复水等只取总获配的
+ * 场景均经此建图，保证建模与弧索引口径完全一致。
+ */
+interface AllocationGraph {
+  dinic: CapacityDinic;
+  S: number;
+  T: number;
+  /** 全部供水上限弧（按供给清单顺序） */
+  supplyArcs: AllocationSupplyArc[];
+  /** 全部无向共享容量管段弧（按管段清单顺序，自环不入图） */
+  pipeArcs: AllocationPipeArc[];
+  /** 已挂接的出口需求弧；可分多次追加（重点配水的两阶段增广） */
+  demandArcs: AllocationDemandArc[];
+  /**
+   * 在当前网络上追加挂接一批「出口 → 超级汇点」需求弧，返回新增弧的下标信息。
+   * 重点配水第二阶段调用时，第一阶段的全部残量（含反向改派弧）原样保留。
+   */
+  attachDemandArcs(demands: { outlet: string; demand: number }[]): AllocationDemandArc[];
+}
+
+/**
+ * 配水建模的内部统一建图器：把供水上限弧、当前开启且非自环的无向共享容量管段弧
+ * 交给同一个 CapacityDinic；出口需求弧由 attachDemandArcs 按需挂接（核验一次挂全，
+ * 重点配水分「先重点、后普通」两批挂接并在同一残量网络上连续增广）。
+ *
+ * 返回各类弧的下标，供水弧 / 需求弧下标用于读取逐供水点、逐出口的实际流量，
+ * 管段正向弧（及其反向配对弧）与各弧下标共同用于最大流后的最小割归属判定。
+ * 纯函数：不修改输入网络与清单。
+ */
+function buildAllocationGraph(
+  network: Network,
+  supplyCapList: { supply: string; cap: number }[],
+  edges: ActiveEdge[],
+  pipeCapacity: (edge: ActiveEdge) => number
+): AllocationGraph {
+  const indexOf = new Map<string, number>();
+  network.nodes.forEach((node, i) => indexOf.set(node, i));
+
+  const dinic = new CapacityDinic(network.nodes.length);
+  const S = dinic.source;
+  const T = dinic.sink;
+
+  const supplyArcs: AllocationSupplyArc[] = supplyCapList.map(({ supply, cap }) => ({
+    supply,
+    cap,
+    arc: dinic.addArc(S, indexOf.get(supply)!, cap),
+  }));
+
+  const pipeArcs: AllocationPipeArc[] = edges.map((e) => ({
+    id: e.id,
+    fwdArc: dinic.addUndirectedShared(indexOf.get(e.from)!, indexOf.get(e.to)!, pipeCapacity(e)),
+  }));
+
+  const demandArcs: AllocationDemandArc[] = [];
+  const attachDemandArcs = (
+    demands: { outlet: string; demand: number }[]
+  ): AllocationDemandArc[] => {
+    const added = demands.map(({ outlet, demand }) => ({
+      outlet,
+      demand,
+      arc: dinic.addArc(indexOf.get(outlet)!, T, demand),
+    }));
+    demandArcs.push(...added);
+    return added;
+  };
+
+  return { dinic, S, T, supplyArcs, pipeArcs, demandArcs, attachDemandArcs };
+}
+
 /**
  * 在给定管段容量下计算总获配量（单源单汇最大流）。
- * 与 verifyCapacity 使用完全相同的建模（无向管段双向共享容量、
- * 源点弧为供给上限、汇点弧为出口需求），仅取最大流值，供增容枚举反复调用。
+ * 经 buildAllocationGraph 统一建图（供水上限弧、无向共享容量管段弧、一次性挂接的
+ * 出口需求弧），仅取最大流值，供增容枚举、双阀风险与复水规划反复调用。
  * 纯函数，不修改输入。
  */
 function computeTotalAllocated(
@@ -1070,26 +1167,9 @@ function computeTotalAllocated(
   edges: ActiveEdge[],
   pipeCapacity: (edge: ActiveEdge) => number
 ): number {
-  const indexOf = new Map<string, number>();
-  network.nodes.forEach((node, i) => indexOf.set(node, i));
-
-  const dinic = new CapacityDinic(network.nodes.length);
-  const S = dinic.source;
-  const T = dinic.sink;
-
-  for (const { supply, cap } of supplyCapList) {
-    dinic.addArc(S, indexOf.get(supply)!, cap);
-  }
-  for (const e of edges) {
-    const u = indexOf.get(e.from)!;
-    const v = indexOf.get(e.to)!;
-    dinic.addUndirectedShared(u, v, pipeCapacity(e));
-  }
-  for (const { outlet, demand } of demandList) {
-    dinic.addArc(indexOf.get(outlet)!, T, demand);
-  }
-
-  return dinic.maxFlow(S, T);
+  const graph = buildAllocationGraph(network, supplyCapList, edges, pipeCapacity);
+  graph.attachDemandArcs(demandList);
+  return graph.dinic.maxFlow(graph.S, graph.T);
 }
 
 /**
@@ -1111,56 +1191,29 @@ export function verifyCapacity(network: Network, query: CapacityQuery): Capacity
   const { supplyCapList, demandList } = valid;
 
   const edges = collectActiveEdges(network);
-  const indexOf = new Map<string, number>();
-  network.nodes.forEach((node, i) => indexOf.set(node, i));
 
-  const dinic = new CapacityDinic(network.nodes.length);
-  const S = dinic.source;
-  const T = dinic.sink;
+  // 共用内部建图器：供水上限弧 + 无向共享容量管段弧 + 全部出口需求弧一次挂齐；
+  // 返回的弧下标用于逐点流量读取与最小割项目归属
+  const graph = buildAllocationGraph(network, supplyCapList, edges, () => 1);
+  graph.attachDemandArcs(demandList);
+  const { dinic, S } = graph;
 
-  // 记录每条瓶颈候选弧，供最小割项目归集
-  const supplyArcIndex = new Map<number, { supply: string; cap: number }>();
-  for (const { supply, cap } of supplyCapList) {
-    const u = indexOf.get(supply)!;
-    const arc = dinic.addArc(S, u, cap);
-    supplyArcIndex.set(arc, { supply, cap });
-  }
-
-  interface PipeArc {
-    id: string;
-    fwdArc: number;
-  }
-  const pipeArcs: PipeArc[] = [];
-  for (const e of edges) {
-    const u = indexOf.get(e.from)!;
-    const v = indexOf.get(e.to)!;
-    const fwdArc = dinic.addUndirectedShared(u, v, 1);
-    pipeArcs.push({ id: e.id, fwdArc });
-  }
-
-  const demandArcIndex = new Map<number, { outlet: string; demand: number }>();
-  for (const { outlet, demand } of demandList) {
-    const v = indexOf.get(outlet)!;
-    const arc = dinic.addArc(v, T, demand);
-    demandArcIndex.set(arc, { outlet, demand });
-  }
-
-  const totalAllocated = dinic.maxFlow(S, T);
+  const totalAllocated = dinic.maxFlow(S, graph.T);
   const inSourceSide = dinic.sourceSideCut(S);
 
   // 各供水点实际供出量 = 其源点弧上的流量
   const supplyRows: CapacitySupplyRow[] = supplyCapList.map(({ supply, cap }) => {
     let used = 0;
-    for (const [arc, info] of supplyArcIndex) {
-      if (info.supply === supply) used += dinic.arcFlow(arc);
+    for (const sa of graph.supplyArcs) {
+      if (sa.supply === supply) used += dinic.arcFlow(sa.arc);
     }
     return { supply, cap, used };
   });
 
   // 各出口获配量 = 其汇点弧上的流量
   const outletFlow = new Map<string, number>();
-  for (const [arc, info] of demandArcIndex) {
-    outletFlow.set(info.outlet, dinic.arcFlow(arc));
+  for (const da of graph.demandArcs) {
+    outletFlow.set(da.outlet, dinic.arcFlow(da.arc));
   }
 
   const rows: CapacityOutletRow[] = demandList.map(({ outlet, demand }) => {
@@ -1182,20 +1235,20 @@ export function verifyCapacity(network: Network, query: CapacityQuery): Capacity
     dinic.initialArcCap(arc) > 0;
 
   const cutItems: CapacityCutItem[] = [];
-  for (const [arc, info] of supplyArcIndex) {
-    if (isCrossing(arc)) {
-      cutItems.push({ kind: 'supply', id: info.supply, capacity: info.cap });
+  for (const sa of graph.supplyArcs) {
+    if (isCrossing(sa.arc)) {
+      cutItems.push({ kind: 'supply', id: sa.supply, capacity: sa.cap });
     }
   }
-  for (const pa of pipeArcs) {
+  for (const pa of graph.pipeArcs) {
     // 无向共享边：任一方向弧饱和跨越割线即该管段受限（两弧至多一条满足）
     if (isCrossing(pa.fwdArc) || isCrossing(pa.fwdArc ^ 1)) {
       cutItems.push({ kind: 'pipe', id: pa.id, capacity: 1 });
     }
   }
-  for (const [arc, info] of demandArcIndex) {
-    if (isCrossing(arc)) {
-      cutItems.push({ kind: 'demand', id: info.outlet, capacity: info.demand });
+  for (const da of graph.demandArcs) {
+    if (isCrossing(da.arc)) {
+      cutItems.push({ kind: 'demand', id: da.outlet, capacity: da.demand });
     }
   }
   // 排序：类型固定顺序（供给→管段→需求），同类按名称/编号，便于阅读与对照
@@ -1271,47 +1324,31 @@ export function verifyPriorityCapacity(network: Network, query: CapacityQuery): 
   const prioritySet = new Set(priorityOutlets);
 
   const edges = collectActiveEdges(network);
-  const indexOf = new Map<string, number>();
-  network.nodes.forEach((node, i) => indexOf.set(node, i));
 
-  const dinic = new CapacityDinic(network.nodes.length);
-  const S = dinic.source;
-  const T = dinic.sink;
-
-  for (const { supply, cap } of supplyCapList) {
-    dinic.addArc(S, indexOf.get(supply)!, cap);
-  }
-  for (const e of edges) {
-    const u = indexOf.get(e.from)!;
-    const v = indexOf.get(e.to)!;
-    dinic.addUndirectedShared(u, v, 1);
-  }
+  // 共用内部建图器先挂好供水上限弧与无向共享容量管段弧；
+  // 出口需求弧由 attachDemandArcs 分两批挂在同一残量网络上
+  const graph = buildAllocationGraph(network, supplyCapList, edges, () => 1);
+  const { dinic, S, T } = graph;
 
   // 第一阶段：只挂重点出口汇点弧，使重点总获配最大
-  const priorityArcIndex = new Map<number, string>();
-  for (const { outlet, demand } of demandList) {
-    if (!prioritySet.has(outlet)) continue;
-    const arc = dinic.addArc(indexOf.get(outlet)!, T, demand);
-    priorityArcIndex.set(arc, outlet);
-  }
+  const priorityDemandArcs = graph.attachDemandArcs(
+    demandList.filter((d) => prioritySet.has(d.outlet))
+  );
   const priorityAllocated = dinic.maxFlow(S, T);
 
-  // 第二阶段：在同一残量网络上补挂普通出口汇点弧继续增广（允许改派第一阶段流量）
-  const normalArcIndex = new Map<number, string>();
-  for (const { outlet, demand } of demandList) {
-    if (prioritySet.has(outlet)) continue;
-    const arc = dinic.addArc(indexOf.get(outlet)!, T, demand);
-    normalArcIndex.set(arc, outlet);
-  }
+  // 第二阶段：在同一残量网络上补挂普通出口汇点弧继续增广（允许经反向弧改派第一阶段流量）
+  const normalDemandArcs = graph.attachDemandArcs(
+    demandList.filter((d) => !prioritySet.has(d.outlet))
+  );
   const secondStageGain = dinic.maxFlow(S, T);
   const totalAllocated = priorityAllocated + secondStageGain;
 
   const allocatedByOutlet = new Map<string, number>();
-  for (const [arc, outlet] of priorityArcIndex) {
-    allocatedByOutlet.set(outlet, dinic.arcFlow(arc));
+  for (const da of priorityDemandArcs) {
+    allocatedByOutlet.set(da.outlet, dinic.arcFlow(da.arc));
   }
-  for (const [arc, outlet] of normalArcIndex) {
-    allocatedByOutlet.set(outlet, dinic.arcFlow(arc));
+  for (const da of normalDemandArcs) {
+    allocatedByOutlet.set(da.outlet, dinic.arcFlow(da.arc));
   }
 
   const rows: PriorityCapacityOutletRow[] = demandList.map(({ outlet, demand }) => {

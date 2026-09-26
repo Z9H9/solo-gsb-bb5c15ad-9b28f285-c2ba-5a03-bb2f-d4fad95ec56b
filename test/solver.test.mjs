@@ -633,6 +633,79 @@ check('第二级经改派后普通 C 也获配 1（无虚假缺口）', prioRow(
 check('总获配为 2，与无重点普通核验一致', p3.totalAllocated === 2 && p3.totalAllocated === p3plain.totalAllocated);
 check('两个出口均足额、总缺口 0', p3.totalShortfall === 0 && p3.rows.every((x) => x.fullySupplied));
 
+console.log('优先配水：共享无阀管段的反向改派（回归：建图器复用与残量回退）：');
+// 与上一场景同构，但五条管全部是无阀管段（pipes），重点验证统一建图器对
+// 「当前开启且非自环的无向共享容量管段」（无阀管段也是其中一类）的反向改派：
+// 第一阶段 S→u→P 占住无阀管 su/up；第二阶段必须沿无阀管 up 的反向残量弧
+// （P→u）改派，走出 S→v→P→u→C，重点不减、总获配 2。
+const reroutePipeOnlyNet = {
+  nodes: ['S', 'u', 'v', 'P', 'C'],
+  pipes: [
+    { id: 'su', from: 'S', to: 'u' },
+    { id: 'sv', from: 'S', to: 'v' },
+    { id: 'up', from: 'u', to: 'P' },
+    { id: 'vp', from: 'v', to: 'P' },
+    { id: 'uc', from: 'u', to: 'C' },
+  ],
+  valvedPipes: [],
+};
+const p3p = solver.verifyPriorityCapacity(reroutePipeOnlyNet, {
+  supplies: ['S'], outlets: ['P', 'C'], priorityOutlets: ['P'],
+  supplyCaps: { S: 5 }, outletDemands: { P: 1, C: 1 },
+});
+const p3pPlain = solver.verifyCapacity(reroutePipeOnlyNet, {
+  supplies: ['S'], outlets: ['P', 'C'],
+  supplyCaps: { S: 5 }, outletDemands: { P: 1, C: 1 },
+});
+check('无阀共享管场景返回 ok', p3p.status === 'ok');
+check('无阀共享管：第一级重点 P 获配 1', p3p.priorityAllocated === 1 && prioRow(p3p, 'P').allocated === 1);
+check('无阀共享管：经反向弧改派后普通 C 获配 1', prioRow(p3p, 'C').allocated === 1);
+check('无阀共享管：总获配 2 且与普通核验一致',
+  p3p.totalAllocated === 2 && p3p.totalAllocated === p3pPlain.totalAllocated);
+// 改派后逐出口获配与普通核验逐点流量完全一致（弧索引读取口径一致）
+check('无阀共享管：两阶段逐出口获配与普通核验逐点相同',
+  p3p.rows.map((r) => `${r.outlet}:${r.allocated}`).sort().join('|') ===
+  p3pPlain.rows.map((r) => `${r.outlet}:${r.allocated}`).sort().join('|'));
+// 参与输水的 5 条无阀管全部计数（无自环）
+check('无阀共享管场景 activePipeCount=5', p3p.activePipeCount === 5 && p3pPlain.activePipeCount === 5);
+
+console.log('优先配水：零重点出口（空名单与缺省字段，回归：第二阶段即普通核验）：');
+// 同一残量网络上先接零条重点需求弧（第一阶段流值为 0），再接全部普通需求弧。
+// 逐出口获配、总获配、总缺口都必须与供水能力核验完全一致，且各重点统计为 0。
+for (const [label, priorityOutlets] of [['空数组', []], ['缺省字段', undefined]]) {
+  const zp = solver.verifyPriorityCapacity(rerouteNet, {
+    supplies: ['S'], outlets: ['P', 'C'], ...(priorityOutlets === undefined ? {} : { priorityOutlets }),
+    supplyCaps: { S: 5 }, outletDemands: { P: 1, C: 1 },
+  });
+  const zpPlain = solver.verifyCapacity(rerouteNet, {
+    supplies: ['S'], outlets: ['P', 'C'],
+    supplyCaps: { S: 5 }, outletDemands: { P: 1, C: 1 },
+  });
+  check(`零重点（${label}）：返回 ok、重点数与重点获配为 0`,
+    zp.status === 'ok' && zp.priorityOutletCount === 0 && zp.priorityAllocated === 0);
+  check(`零重点（${label}）：重点需求 / 缺口均为 0`, zp.priorityDemand === 0 && zp.priorityShortfall === 0);
+  check(`零重点（${label}）：总获配与普通核验一致（2）`, zp.totalAllocated === zpPlain.totalAllocated);
+  check(`零重点（${label}）：普通获配即总获配`, zp.normalAllocated === zp.totalAllocated);
+  check(`零重点（${label}）：逐出口获配与普通核验一致`,
+    zp.rows.map((r) => `${r.outlet}:${r.allocated}`).sort().join('|') ===
+    zpPlain.rows.map((r) => `${r.outlet}:${r.allocated}`).sort().join('|'));
+  check(`零重点（${label}）：全部行标记为普通`, zp.rows.every((r) => r.category === 'normal'));
+}
+// 主网络上的零重点回归：c1 中 B 占 1、C+D 共 1，逐点分配须与核验一致
+const zpMain = solver.verifyPriorityCapacity(network, {
+  supplies: ['S1', 'S2'], outlets: ['B', 'C', 'D'], priorityOutlets: [],
+  supplyCaps: { S1: 5, S2: 3 }, outletDemands: { B: 2, C: 1, D: 1 },
+});
+check('零重点（主网络）：总获配 2、重点统计归零、普通获配 2',
+  zpMain.status === 'ok' && zpMain.priorityOutletCount === 0 && zpMain.priorityAllocated === 0 &&
+  zpMain.totalAllocated === 2 && zpMain.normalAllocated === 2 &&
+  zpMain.priorityDemand === 0 && zpMain.priorityShortfall === 0);
+check('零重点（主网络）：B 获配 1、C+D 合计 1（与核验同口径）',
+  capRow(c1, 'B').allocated === 1 &&
+  prioRow(zpMain, 'B').allocated === capRow(c1, 'B').allocated &&
+  prioRow(zpMain, 'C').allocated + prioRow(zpMain, 'D').allocated ===
+    capRow(c1, 'C').allocated + capRow(c1, 'D').allocated);
+
 console.log('优先配水：长链管网两阶段（回归：复用同一迭代增广搜索）：');
 // 14000 节点单链（longChainNet）：首端供给 2，链中点普通出口需求 1、末端重点出口需求 1。
 // 每段管共享容量 1，全链只能通 1：第一阶段重点（末端）获配 1 占满全链，
