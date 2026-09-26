@@ -633,6 +633,83 @@ check('第二级经改派后普通 C 也获配 1（无虚假缺口）', prioRow(
 check('总获配为 2，与无重点普通核验一致', p3.totalAllocated === 2 && p3.totalAllocated === p3plain.totalAllocated);
 check('两个出口均足额、总缺口 0', p3.totalShortfall === 0 && p3.rows.every((x) => x.fullySupplied));
 
+console.log('优先配水：内部共享管段经反向弧改派（回归：共享容量反向记账）：');
+// 重点 P 与普通 C 共用一条不直接连接出口的内部共享管段 A—B。
+// 管段插入顺序刻意保证第一阶段首条增广路为 S→A→B→P（Dinic 弧链后插先试：
+// S—A 晚于 S—X、A—B 晚于 A—C、B—P 晚于 X—B），第一阶段先占住共享管段 A—B；
+// 第二阶段必须走 S→X→B，再沿 B→A 反向残量弧回退 A—B，由 A→C 给普通出口 C
+// 送水（P 改由 X 侧供给、共享管段双向记账改派给 C）。若共享管段的反向改派
+// 通道失效，第二阶段无法增广，总获配会停在 1、C 出现虚假缺口。
+const sharedRerouteNet = {
+  nodes: ['S', 'X', 'A', 'B', 'P', 'C'],
+  pipes: [],
+  valvedPipes: [
+    { id: 'gSX', from: 'S', to: 'X', open: true },
+    { id: 'gSA', from: 'S', to: 'A', open: true },
+    { id: 'gAC', from: 'A', to: 'C', open: true },
+    { id: 'gAB', from: 'A', to: 'B', open: true },
+    { id: 'gXB', from: 'X', to: 'B', open: true },
+    { id: 'gBP', from: 'B', to: 'P', open: true },
+  ],
+};
+const sharedRerouteQuery = {
+  supplies: ['S'], outlets: ['P', 'C'],
+  supplyCaps: { S: 2 }, outletDemands: { P: 1, C: 1 },
+};
+const srpPlain = solver.verifyCapacity(sharedRerouteNet, sharedRerouteQuery);
+check('内部共享管段改派场景：普通核验总获配为 2', srpPlain.status === 'ok' &&
+  srpPlain.totalAllocated === 2);
+check('内部共享管段改派场景：普通核验两出口均足额', srpPlain.status === 'ok' &&
+  srpPlain.rows.every((x) => x.fullySupplied));
+const srp = solver.verifyPriorityCapacity(sharedRerouteNet, {
+  ...sharedRerouteQuery, priorityOutlets: ['P'],
+});
+check('内部共享管段改派场景返回 ok', srp.status === 'ok');
+check('第一阶段重点 P 先获配 1（首条增广路占住 A—B）', srp.status === 'ok' &&
+  srp.priorityAllocated === 1 && prioRow(srp, 'P').allocated === 1);
+check('第二阶段经 B→A 共享管段反向弧改派后普通 C 获配 1', srp.status === 'ok' &&
+  prioRow(srp, 'C').allocated === 1);
+check('改派后总获配为 2、两出口均足额、总缺口 0', srp.status === 'ok' &&
+  srp.totalAllocated === 2 && srp.totalShortfall === 0 &&
+  srp.rows.every((x) => x.fullySupplied));
+check('改派后重点总获配不减少（第一级目标保持 1）', srp.status === 'ok' &&
+  srp.priorityAllocated === 1);
+// 普通核验下该图的瓶颈为供水上限 2（两单位经 S—A、S—X 分别送出）
+check('内部共享管段改派场景最小割容量合计 2', srpPlain.status === 'ok' &&
+  srpPlain.cutCapacity === 2);
+
+console.log('优先配水：零重点出口回归（显式空名单 / 缺省字段 / 全重点）：');
+// 无任何重点出口时第一阶段不挂任何需求弧（增广 0），第二阶段即普通最大流；
+// 结果须与普通核验逐项一致（含每个出口获配量），在需要共享管段反向改派的
+// 网络上也不能因「空第一阶段」而少配。
+const zeroPrioCases = [
+  ['显式空名单', { priorityOutlets: [] }],
+  ['缺省字段', {}],
+];
+for (const [tag, extra] of zeroPrioCases) {
+  const plain = solver.verifyCapacity(sharedRerouteNet, sharedRerouteQuery);
+  const pri = solver.verifyPriorityCapacity(sharedRerouteNet, { ...sharedRerouteQuery, ...extra });
+  check(`零重点（${tag}）返回 ok 且重点出口数为 0`, pri.status === 'ok' &&
+    pri.priorityOutletCount === 0);
+  check(`零重点（${tag}）重点总获配为 0`, pri.status === 'ok' &&
+    pri.priorityAllocated === 0 && pri.priorityShortfall === 0);
+  check(`零重点（${tag}）总获配与普通核验一致（2）`, pri.status === 'ok' &&
+    pri.totalAllocated === plain.totalAllocated && pri.totalAllocated === 2);
+  check(`零重点（${tag}）逐出口获配与普通核验一致且均标普通`, pri.status === 'ok' &&
+    pri.rows.length === plain.rows.length &&
+    pri.rows.every((row) => {
+      const ref = plain.rows.find((x) => x.outlet === row.outlet);
+      return !!ref && row.allocated === ref.allocated && row.category === 'normal';
+    }));
+}
+// 全部出口都列为重点时不存在普通需求弧：第二阶段无可增广，重点值即总获配
+const allPrio = solver.verifyPriorityCapacity(sharedRerouteNet, {
+  ...sharedRerouteQuery, priorityOutlets: ['P', 'C'],
+});
+check('全部出口为重点时重点总获配 2、普通获配 0、总获配 2', allPrio.status === 'ok' &&
+  allPrio.priorityAllocated === 2 && allPrio.normalAllocated === 0 &&
+  allPrio.totalAllocated === 2 && allPrio.priorityOutletCount === 2);
+
 console.log('优先配水：长链管网两阶段（回归：复用同一迭代增广搜索）：');
 // 14000 节点单链（longChainNet）：首端供给 2，链中点普通出口需求 1、末端重点出口需求 1。
 // 每段管共享容量 1，全链只能通 1：第一阶段重点（末端）获配 1 占满全链，
